@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Temp folder
+tmp/
+# Локальные файлы состояния MiniKV
+/data/data.json
+/data/*.tmp
+/data/.*.tmp

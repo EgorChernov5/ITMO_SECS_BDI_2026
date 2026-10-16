@@ -1,0 +1,24 @@
+[project]
+name = "minikv"
+version = "0.1.0"
+description = "Учебная архитектура распределённой базы данных MiniKV"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pytest>=9.1.1",
+]
+
+[project.scripts]
+minikv = "src.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "--strict-markers"
