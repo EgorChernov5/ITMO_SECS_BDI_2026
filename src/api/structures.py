@@ -65,6 +65,20 @@ class HealthResponse(BaseModel):
     status: str
 
 
+class ShardResponse(BaseModel):
+    """
+    Описывает результат детерминированного выбора сегмента.
+
+    Attributes:
+        shard (str): Уникальный идентификатор выбранного сегмента.
+
+    Fallbacks:
+        Адреса узлов и сведения о репликах в ответ не включаются.
+    """
+
+    shard: str
+
+
 class MutationResponse(BaseModel):
     """
     Описывает одну операцию внутренней ленты репликации.

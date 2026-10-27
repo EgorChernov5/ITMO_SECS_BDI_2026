@@ -1,17 +1,15 @@
 ﻿param(
     [string]$PrimaryUrl = $env:PRIMARY_URL,
-    [string]$Replica1Url = $env:REPLICA_1_URL,
-    [string]$Replica2Url = $env:REPLICA_2_URL,
+    [string]$ReplicaUrl = $env:REPLICA_URL,
+    [string]$PrimaryService = "shard-0-primary",
+    [string]$ReplicaService = "shard-0-replica",
     [string]$DemoKey = ""
 )
 
 $ErrorActionPreference = "Stop"
 
 function Get-ComposeUrl {
-    param(
-        [string]$Service,
-        [string]$FallbackPort
-    )
+    param([string]$Service, [string]$FallbackPort)
 
     $binding = docker compose port $Service 8000
     if ($LASTEXITCODE -eq 0 -and $binding) {
@@ -22,26 +20,22 @@ function Get-ComposeUrl {
 }
 
 if (-not $PrimaryUrl) {
-    $fallback = if ($env:MINIKV_PORT) { $env:MINIKV_PORT } else { "8000" }
-    $PrimaryUrl = Get-ComposeUrl -Service "primary" -FallbackPort $fallback
-}
-if (-not $Replica1Url) {
-    $fallback = if ($env:MINIKV_REPLICA_1_PORT) {
-        $env:MINIKV_REPLICA_1_PORT
+    $fallback = if ($env:MINIKV_SHARD_0_PRIMARY_PORT) {
+        $env:MINIKV_SHARD_0_PRIMARY_PORT
     }
     else {
         "8001"
     }
-    $Replica1Url = Get-ComposeUrl -Service "replica-1" -FallbackPort $fallback
+    $PrimaryUrl = Get-ComposeUrl -Service $PrimaryService -FallbackPort $fallback
 }
-if (-not $Replica2Url) {
-    $fallback = if ($env:MINIKV_REPLICA_2_PORT) {
-        $env:MINIKV_REPLICA_2_PORT
+if (-not $ReplicaUrl) {
+    $fallback = if ($env:MINIKV_SHARD_0_REPLICA_PORT) {
+        $env:MINIKV_SHARD_0_REPLICA_PORT
     }
     else {
         "8002"
     }
-    $Replica2Url = Get-ComposeUrl -Service "replica-2" -FallbackPort $fallback
+    $ReplicaUrl = Get-ComposeUrl -Service $ReplicaService -FallbackPort $fallback
 }
 if (-not $DemoKey) {
     $timestamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
@@ -49,10 +43,7 @@ if (-not $DemoKey) {
 }
 
 function Wait-ReplicationSequence {
-    param(
-        [string]$BaseUrl,
-        [int]$ExpectedSequence
-    )
+    param([string]$BaseUrl, [int]$ExpectedSequence)
 
     for ($attempt = 1; $attempt -le 30; $attempt++) {
         try {
@@ -73,7 +64,7 @@ function Wait-ReplicationSequence {
     throw "Реплика $BaseUrl не достигла операции $ExpectedSequence."
 }
 
-# Записываем первое значение и ждём обе реплики.
+# Записываем значение напрямую в primary выбранного сегмента.
 $body = @{ value = @{ stage = 1 } } | ConvertTo-Json -Compress
 $put = @{
     Method = "Put"
@@ -85,34 +76,44 @@ Invoke-RestMethod @put | Out-Null
 $sequence = (
     Invoke-RestMethod -Uri "$PrimaryUrl/replication/status"
 ).current_sequence
-Wait-ReplicationSequence -BaseUrl $Replica1Url -ExpectedSequence $sequence
-Wait-ReplicationSequence -BaseUrl $Replica2Url -ExpectedSequence $sequence
-Invoke-RestMethod -Uri "$Replica1Url/kv/$DemoKey" | ConvertTo-Json -Compress
-Invoke-RestMethod -Uri "$Replica2Url/kv/$DemoKey" | ConvertTo-Json -Compress
+Wait-ReplicationSequence -BaseUrl $ReplicaUrl -ExpectedSequence $sequence
+Invoke-RestMethod -Uri "$ReplicaUrl/kv/$DemoKey" |
+    ConvertTo-Json -Compress
 
-# Останавливаем вторую реплику и проверяем догоняющую синхронизацию.
-docker compose stop replica-2
+# Останавливаем реплику, меняем primary и проверяем догоняющую синхронизацию.
+docker compose stop $ReplicaService
+if ($LASTEXITCODE -ne 0) {
+    throw "Не удалось остановить сервис $ReplicaService."
+}
+
 $body = @{ value = @{ stage = 2 } } | ConvertTo-Json -Compress
 $put.Body = $body
 Invoke-RestMethod @put | Out-Null
 Invoke-RestMethod -Method Delete -Uri "$PrimaryUrl/kv/$DemoKey" | Out-Null
-docker compose start replica-2
+
+docker compose start $ReplicaService
+if ($LASTEXITCODE -ne 0) {
+    throw "Не удалось запустить сервис $ReplicaService."
+}
 
 $sequence = (
     Invoke-RestMethod -Uri "$PrimaryUrl/replication/status"
 ).current_sequence
-Wait-ReplicationSequence -BaseUrl $Replica2Url -ExpectedSequence $sequence
+Wait-ReplicationSequence -BaseUrl $ReplicaUrl -ExpectedSequence $sequence
 
 try {
-    Invoke-RestMethod -Uri "$Replica2Url/kv/$DemoKey" | Out-Null
+    Invoke-RestMethod -Uri "$ReplicaUrl/kv/$DemoKey" | Out-Null
     throw "После синхронизации ключ не должен существовать."
 }
 catch {
-    if ($_.Exception.Response.StatusCode.value__ -ne 404) {
+    if (-not $_.Exception.Response) {
+        throw
+    }
+    if ([int]$_.Exception.Response.StatusCode -ne 404) {
         throw
     }
 }
 
-Invoke-RestMethod -Uri "$Replica2Url/replication/status" |
+Invoke-RestMethod -Uri "$ReplicaUrl/replication/status" |
     ConvertTo-Json -Compress
-Write-Host "Сценарий остановки и восстановления реплики завершён."
+Write-Host "Сценарий восстановления $ReplicaService завершён."

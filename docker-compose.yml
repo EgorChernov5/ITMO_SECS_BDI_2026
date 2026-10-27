@@ -21,48 +21,77 @@ x-minikv: &minikv
   restart: unless-stopped
 
 services:
-  primary:
+  router:
+    <<: *minikv
+    command: [uv, run, --no-sync, uvicorn, src.sharding.router:app, --host, 0.0.0.0, --port, "8000"]
+    depends_on:
+      shard-0-primary:
+        condition: service_healthy
+      shard-1-primary:
+        condition: service_healthy
+    environment:
+      MINIKV_SHARD_0_ID: shard-0
+      MINIKV_SHARD_0_URL: http://shard-0-primary:8000
+      MINIKV_SHARD_1_ID: shard-1
+      MINIKV_SHARD_1_URL: http://shard-1-primary:8000
+      MINIKV_SHARD_REQUEST_TIMEOUT: "${MINIKV_SHARD_REQUEST_TIMEOUT:-5.0}"
+    ports:
+      - "${MINIKV_PORT:-8000}:8000"
+
+  shard-0-primary:
     <<: *minikv
     environment:
       MINIKV_DATA_FILE: /data/data.json
       MINIKV_NODE_ROLE: primary
       MINIKV_REPLICATION_LOG: /data/operations.jsonl
     ports:
-      - "${MINIKV_PORT:-8000}:8000"
+      - "${MINIKV_SHARD_0_PRIMARY_PORT:-8001}:8000"
     volumes:
-      - minikv-data:/data
+      - shard-0-primary-data:/data
 
-  replica-1:
+  shard-0-replica:
     <<: *minikv
     depends_on:
-      primary:
+      shard-0-primary:
         condition: service_healthy
     environment:
       MINIKV_DATA_FILE: /data/data.json
       MINIKV_NODE_ROLE: replica
-      MINIKV_PRIMARY_URL: http://primary:8000
+      MINIKV_PRIMARY_URL: http://shard-0-primary:8000
       MINIKV_REPLICATION_LOG: /data/operations.jsonl
     ports:
-      - "${MINIKV_REPLICA_1_PORT:-8001}:8000"
+      - "${MINIKV_SHARD_0_REPLICA_PORT:-8002}:8000"
     volumes:
-      - minikv-replica-1-data:/data
+      - shard-0-replica-data:/data
 
-  replica-2:
+  shard-1-primary:
+    <<: *minikv
+    environment:
+      MINIKV_DATA_FILE: /data/data.json
+      MINIKV_NODE_ROLE: primary
+      MINIKV_REPLICATION_LOG: /data/operations.jsonl
+    ports:
+      - "${MINIKV_SHARD_1_PRIMARY_PORT:-8003}:8000"
+    volumes:
+      - shard-1-primary-data:/data
+
+  shard-1-replica:
     <<: *minikv
     depends_on:
-      primary:
+      shard-1-primary:
         condition: service_healthy
     environment:
       MINIKV_DATA_FILE: /data/data.json
       MINIKV_NODE_ROLE: replica
-      MINIKV_PRIMARY_URL: http://primary:8000
+      MINIKV_PRIMARY_URL: http://shard-1-primary:8000
       MINIKV_REPLICATION_LOG: /data/operations.jsonl
     ports:
-      - "${MINIKV_REPLICA_2_PORT:-8002}:8000"
+      - "${MINIKV_SHARD_1_REPLICA_PORT:-8004}:8000"
     volumes:
-      - minikv-replica-2-data:/data
+      - shard-1-replica-data:/data
 
 volumes:
-  minikv-data:
-  minikv-replica-1-data:
-  minikv-replica-2-data:
+  shard-0-primary-data:
+  shard-0-replica-data:
+  shard-1-primary-data:
+  shard-1-replica-data:

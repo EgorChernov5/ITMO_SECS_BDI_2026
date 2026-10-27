@@ -109,3 +109,23 @@ Replication diagnostics are available at `/replication/status`. See
 [the Lab 4 report](docs/lab4.md) and
 [the interaction diagram](docs/diagrams/lab4_replication.md) for configuration,
 consistency behavior, recovery flow, and documented limitations.
+
+### Lab 5 - sharding with replication
+
+The final topology exposes one router in front of two independently replicated
+shards. Routing uses the complete UTF-8 key, SHA-256 interpreted as a
+non-negative integer, and modulo two.
+
+```bash
+docker compose up --build -d
+bash scripts/demo_sharding.sh
+
+# PowerShell
+.\\scripts\\demo_sharding.ps1
+```
+
+Normal clients use only `http://localhost:8000`. The storage ports 8001-8004
+are published for defense diagnostics. `GET /shards/{key}` reports the stable
+shard identifier without contacting storage nodes. See
+[the Lab 5 report](docs/lab5.md) and
+[the final architecture](docs/diagrams/lab5_architecture.md).

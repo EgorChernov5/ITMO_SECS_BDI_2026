@@ -14,6 +14,7 @@ dependencies = [
 [project.scripts]
 minikv = "src.cli:main"
 minikv-api = "src.api.app:main"
+minikv-router = "src.sharding.router:main"
 
 [build-system]
 requires = ["hatchling"]
