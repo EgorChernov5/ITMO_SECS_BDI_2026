@@ -13,7 +13,8 @@
 - ответы при внутренних ошибках не раскрывают пути, трассировки или секреты;
 - зависимость хранилища заменяется через механизм FastAPI dependency overrides;
 - добавлены интеграционные тесты без внешнего сервера;
-- Docker Compose публикует настраиваемый порт и подключает постоянный том;
+- Docker Compose публикует настраиваемый порт основного узла и подключает
+  постоянный том, совместимый с односервисным развёртыванием;
 - `scripts/demo_api.ps1` выполняет повторяемый сценарий с изолированным ключом в Bash и PowerShell соответственно.
 
 ## 3. Архитектура
@@ -50,14 +51,20 @@ uv run --env-file .env minikv-api
 
 `MINIKV_DATA_FILE` задаёт локальный JSON-файл, а `MINIKV_PORT` - порт локального HTTP-сервера. Значения по умолчанию остаются `data/data.json` и `8000`.
 
-Контейнерный сервис автоматически читает `MINIKV_PORT` из корневого файла `.env`. Внутри контейнера база всегда хранится в `/data/data.json`, чтобы локальный путь из `MINIKV_DATA_FILE` не отключал именованный том:
+Основной контейнер `primary` автоматически читает `MINIKV_PORT` из корневого
+файла `.env`. Внутри контейнера база всегда хранится в `/data/data.json`:
 
 ```bash
-docker compose up --build -d
-docker compose ps
+docker compose up --build -d primary
+docker compose ps primary
 ```
 
-Для изменения опубликованного порта достаточно изменить `MINIKV_PORT` в `.env` и повторно выполнить `docker compose up -d`.
+Такой запуск сохраняет односервисную топологию третьей лабораторной работы и
+не требует свободных портов реплик. Запуск без имени сервиса поднимает также
+`replica-1` и `replica-2` для четвёртой лабораторной работы.
+
+Для изменения опубликованного порта достаточно изменить `MINIKV_PORT` в `.env`
+и повторно выполнить `docker compose up -d primary`.
 
 ## 6. Примеры запросов
 
@@ -113,7 +120,7 @@ Invoke-RestMethod `
     -ContentType "application/json; charset=utf-8" `
     -Body $body
 
-docker compose up --build -d --force-recreate
+docker compose up --build -d --force-recreate primary
 
 $response = Invoke-WebRequest -UseBasicParsing `
     "$baseUrl/kv/persistence-check"
