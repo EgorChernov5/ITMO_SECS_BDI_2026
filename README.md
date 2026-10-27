@@ -53,3 +53,33 @@ Runtime database files are ignored by Git. A safe example document is available
 at [data/data.example.json](data/data.example.json). See
 [the Lab 2 report](docs/lab2.md) for the architecture, demonstration, and
 verification commands.
+
+### Lab 3 — REST API and containers
+
+The third milestone exposes the persistent store through FastAPI and packages
+it as a non-root Docker Compose service with a named data volume:
+
+```bash
+docker compose up --build -d
+sh scripts/demo_api.sh
+```
+
+In PowerShell, use its built-in HTTP client and the PowerShell demo script
+instead of the Unix-specific `curl` and `sh` commands:
+
+```powershell
+docker compose up --build -d
+.\scripts\demo_api.ps1
+```
+
+For local startup, both `MINIKV_DATA_FILE` and `MINIKV_PORT` can be loaded
+from the root `.env` file:
+
+```bash
+uv run --env-file .env minikv-api
+```
+
+OpenAPI documentation is available at the configured port. Docker Compose also
+reads `.env` automatically and uses `MINIKV_PORT` as the published host port. See [the Lab 3 report](docs/lab3.md) and
+[the deployment diagram](docs/diagrams/lab3_deployment.md) for the endpoint
+contract, remote-access example, and persistence verification procedure.
