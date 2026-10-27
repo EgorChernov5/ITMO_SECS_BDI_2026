@@ -1,6 +1,7 @@
 """Содержит общие структуры данных для интерфейсов MiniKV."""
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 
 type JsonScalar = str | int | float | bool | None
@@ -23,6 +24,22 @@ class MutationType(StrEnum):
     DELETE = "delete"
 
 
+class NodeRole(StrEnum):
+    """
+    Задаёт роль узла в топологии репликации.
+
+    Attributes:
+        PRIMARY (str): Основной узел, принимающий изменения.
+        REPLICA (str): Узел только для чтения, получающий изменения.
+
+    Fallbacks:
+        Не предусмотрены.
+    """
+
+    PRIMARY = "primary"
+    REPLICA = "replica"
+
+
 @dataclass(frozen=True, slots=True)
 class Mutation:
     """
@@ -42,6 +59,34 @@ class Mutation:
     operation: MutationType
     key: str
     value: JsonValue | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReplicationStatus:
+    """
+    Описывает текущее состояние репликации узла.
+
+    Attributes:
+        role (NodeRole): Роль текущего узла.
+        current_sequence (int): Последний локально применённый номер.
+        primary_sequence (int | None): Известный номер основного узла.
+        lag (int | None): Известное отставание от основного узла.
+        healthy (bool): Признак отсутствия обнаруженной ошибки репликации.
+        last_successful_sync (datetime | None): Время последнего успешного
+            опроса основного узла.
+        last_error (str | None): Безопасное описание последней ошибки.
+
+    Fallbacks:
+        Для основного узла неизвестные поля синхронизации равны None.
+    """
+
+    role: NodeRole
+    current_sequence: int
+    primary_sequence: int | None
+    lag: int | None
+    healthy: bool
+    last_successful_sync: datetime | None
+    last_error: str | None
 
 
 @dataclass(frozen=True, slots=True)

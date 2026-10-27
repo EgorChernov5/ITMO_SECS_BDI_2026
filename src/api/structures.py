@@ -1,8 +1,10 @@
 """Содержит транспортные структуры REST API MiniKV."""
 
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict
 
-from src.structures import JsonValue
+from src.structures import JsonValue, MutationType, NodeRole
 
 
 class PutRequest(BaseModel):
@@ -61,3 +63,65 @@ class HealthResponse(BaseModel):
     """
 
     status: str
+
+
+class MutationResponse(BaseModel):
+    """
+    Описывает одну операцию внутренней ленты репликации.
+
+    Attributes:
+        sequence (int): Последовательный номер операции.
+        operation (MutationType): Тип изменения.
+        key (str): Изменённый ключ.
+        value (JsonValue | None): Значение операции put. По умолчанию: None.
+
+    Fallbacks:
+        Поле value отсутствует в сериализованной операции delete.
+    """
+
+    sequence: int
+    operation: MutationType
+    key: str
+    value: JsonValue | None = None
+
+
+class OperationsResponse(BaseModel):
+    """
+    Описывает ограниченную пачку операций основного узла.
+
+    Attributes:
+        primary_sequence (int): Последний номер основного узла.
+        operations (list[MutationResponse]): Операции после курсора.
+
+    Fallbacks:
+        При отсутствии новых операций список пуст.
+    """
+
+    primary_sequence: int
+    operations: list[MutationResponse]
+
+
+class ReplicationStatusResponse(BaseModel):
+    """
+    Описывает публичный диагностический статус репликации.
+
+    Attributes:
+        role (NodeRole): Роль текущего узла.
+        current_sequence (int): Последний локальный номер.
+        primary_sequence (int | None): Последний известный номер primary.
+        lag (int | None): Известное отставание.
+        healthy (bool): Признак отсутствия ошибки.
+        last_successful_sync (datetime | None): Время успешной синхронизации.
+        last_error (str | None): Безопасное описание последней ошибки.
+
+    Fallbacks:
+        Неизвестные значения представлены как None.
+    """
+
+    role: NodeRole
+    current_sequence: int
+    primary_sequence: int | None
+    lag: int | None
+    healthy: bool
+    last_successful_sync: datetime | None
+    last_error: str | None

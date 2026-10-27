@@ -48,3 +48,14 @@ class NodeUnavailableError(MiniKVError):
         Не предусмотрены.
     """
 
+
+class ReplicationError(MiniKVError):
+    """
+    Сообщает о нарушении порядка или состояния репликации.
+
+    Attributes:
+        Не предусмотрены.
+
+    Fallbacks:
+        Не предусмотрены.
+    """

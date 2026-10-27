@@ -1,28 +1,49 @@
-"""Предоставляет REST API над одним экземпляром хранилища MiniKV."""
+"""Предоставляет REST API над реплицируемым хранилищем MiniKV."""
 
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlparse
 
 import uvicorn
-from fastapi import Depends, FastAPI, Request, Response, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.responses import JSONResponse
 
 from src.api.structures import (
     HealthResponse,
     KeysResponse,
+    MutationResponse,
+    OperationsResponse,
     PutRequest,
+    ReplicationStatusResponse,
     ValueResponse,
+)
+from src.constants import (
+    DEFAULT_DATA_FILE,
+    DEFAULT_REPLICATION_BATCH_SIZE,
+    DEFAULT_REPLICATION_POLL_INTERVAL,
+    DEFAULT_REPLICATION_REQUEST_TIMEOUT,
 )
 from src.errors import (
     KeyNotFoundError,
     NodeUnavailableError,
     PersistenceError,
+    ReplicationError,
 )
 from src.interfaces import IKeyValueStore
+from src.replication import ReplicationManager
 from src.storage import JsonStorage
 from src.store import KeyValueStore
-
-DEFAULT_DATA_FILE = Path("data/data.json")
+from src.structures import NodeRole
 
 
 def get_store(request: Request) -> IKeyValueStore:
@@ -39,6 +60,22 @@ def get_store(request: Request) -> IKeyValueStore:
         Зависимость может быть заменена через FastAPI dependency overrides.
     """
     return request.app.state.store
+
+
+def get_replication_manager(request: Request) -> ReplicationManager:
+    """
+    Возвращает менеджер репликации текущего приложения.
+
+    Parameters:
+        request (Request): Текущий HTTP-запрос FastAPI.
+
+    Returns:
+        ReplicationManager: Настроенный менеджер текущего узла.
+
+    Fallbacks:
+        Зависимость может быть заменена через FastAPI dependency overrides.
+    """
+    return request.app.state.replication_manager
 
 
 async def handle_missing_key(
@@ -127,6 +164,29 @@ async def handle_unavailable_node(
     )
 
 
+async def handle_replication_error(
+    request: Request,
+    error: ReplicationError,
+) -> JSONResponse:
+    """
+    Скрывает детали нарушения репликации за HTTP 503.
+
+    Parameters:
+        request (Request): Текущий HTTP-запрос FastAPI.
+        error (ReplicationError): Ошибка порядка или синхронизации.
+
+    Returns:
+        JSONResponse: Ответ с кодом HTTP 503.
+
+    Fallbacks:
+        Внутренние номера и адреса не раскрываются клиенту.
+    """
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Ошибка репликации"},
+    )
+
+
 async def handle_unexpected_error(
     request: Request,
     error: Exception,
@@ -150,29 +210,150 @@ async def handle_unexpected_error(
     )
 
 
-def create_app(data_file: str | Path | None = None) -> FastAPI:
+def create_app(
+    data_file: str | Path | None = None,
+    *,
+    role: str | NodeRole | None = None,
+    replication_log: str | Path | None = None,
+    primary_url: str | None = None,
+    polling_interval: float | None = None,
+    batch_size: int | None = None,
+    request_timeout: float | None = None,
+) -> FastAPI:
     """
-    Создаёт REST-приложение с одним постоянным экземпляром MiniKV.
+    Создаёт REST-приложение с постоянным состоянием и репликацией.
 
     Parameters:
         data_file (str | Path | None): Путь к JSON-файлу базы. По умолчанию:
-            None, при котором используется MINIKV_DATA_FILE или
-            data/data.json.
+            None, при котором используется MINIKV_DATA_FILE.
+        role (str | NodeRole | None): Роль узла. По умолчанию: None.
+        replication_log (str | Path | None): Путь к журналу. По умолчанию:
+            None.
+        primary_url (str | None): Адрес primary для реплики. По умолчанию:
+            None.
+        polling_interval (float | None): Интервал опроса. По умолчанию: None.
+        batch_size (int | None): Максимальный размер пачки. По умолчанию: None.
+        request_timeout (float | None): Тайм-аут запроса. По умолчанию: None.
 
     Returns:
         FastAPI: Настроенное приложение REST API.
 
     Fallbacks:
-        Ошибка первоначальной загрузки состояния прерывает создание
-        приложения; зависимости endpoint можно заменить в тестах.
+        Невозможная конфигурация или повреждённое состояние прерывает создание
+        приложения явной ошибкой.
     """
-    configured_path = data_file or os.getenv("MINIKV_DATA_FILE") or DEFAULT_DATA_FILE
+    configured_path = Path(
+        data_file or os.getenv("MINIKV_DATA_FILE") or DEFAULT_DATA_FILE
+    )
+    role_value = role or os.getenv("MINIKV_NODE_ROLE", NodeRole.PRIMARY.value)
+    try:
+        configured_role = NodeRole(role_value)
+    except ValueError as error:
+        raise ValueError(
+            "MINIKV_NODE_ROLE должен быть primary или replica"
+        ) from error
+
+    configured_primary_url = primary_url or os.getenv("MINIKV_PRIMARY_URL")
+    configured_log = Path(
+        replication_log
+        or os.getenv("MINIKV_REPLICATION_LOG")
+        or configured_path.with_suffix(configured_path.suffix + ".operations.jsonl")
+    )
+    try:
+        configured_polling_interval = (
+            polling_interval
+            if polling_interval is not None
+            else float(
+                os.getenv(
+                    "MINIKV_REPLICATION_POLL_INTERVAL",
+                    str(DEFAULT_REPLICATION_POLL_INTERVAL),
+                )
+            )
+        )
+        configured_batch_size = (
+            batch_size
+            if batch_size is not None
+            else int(
+                os.getenv(
+                    "MINIKV_REPLICATION_BATCH_SIZE",
+                    str(DEFAULT_REPLICATION_BATCH_SIZE),
+                )
+            )
+        )
+        configured_request_timeout = (
+            request_timeout
+            if request_timeout is not None
+            else float(
+                os.getenv(
+                    "MINIKV_REPLICATION_REQUEST_TIMEOUT",
+                    str(DEFAULT_REPLICATION_REQUEST_TIMEOUT),
+                )
+            )
+        )
+    except ValueError as error:
+        raise ValueError(
+            "Числовые параметры репликации имеют неверный формат"
+        ) from error
+
+    if configured_polling_interval <= 0:
+        raise ValueError("Интервал опроса должен быть больше нуля")
+    if configured_batch_size < 1:
+        raise ValueError("Размер пачки должен быть положительным")
+    if configured_request_timeout <= 0:
+        raise ValueError("Тайм-аут репликации должен быть больше нуля")
+    if configured_path.absolute() == configured_log.absolute():
+        raise ValueError("Файл данных и журнал репликации должны различаться")
+    if configured_role is NodeRole.REPLICA:
+        parsed_primary_url = urlparse(configured_primary_url or "")
+        if (
+            parsed_primary_url.scheme not in {"http", "https"}
+            or not parsed_primary_url.netloc
+        ):
+            raise ValueError(
+                "Для replica требуется корректный MINIKV_PRIMARY_URL"
+            )
+    elif configured_primary_url is not None:
+        raise ValueError("Primary не должен содержать MINIKV_PRIMARY_URL")
+
+    store = KeyValueStore(JsonStorage(configured_path))
+    manager = ReplicationManager(
+        store=store,
+        role=configured_role,
+        log_path=configured_log,
+        primary_url=configured_primary_url,
+        polling_interval=configured_polling_interval,
+        batch_size=configured_batch_size,
+        request_timeout=configured_request_timeout,
+    )
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        """
+        Запускает и останавливает фоновую задачу репликации.
+
+        Parameters:
+            application (FastAPI): Текущее приложение.
+
+        Returns:
+            AsyncIterator[None]: Управляющий итератор жизненного цикла.
+
+        Fallbacks:
+            Основной узел не создаёт фоновую задачу.
+        """
+        await manager.start()
+        try:
+            yield
+        finally:
+            await manager.stop()
+
     application = FastAPI(
         title="MiniKV API",
         description="Сетевой интерфейс учебной базы ключей и JSON-значений.",
-        version="0.1.0",
+        version="0.2.0",
+        lifespan=lifespan,
     )
-    application.state.store = KeyValueStore(JsonStorage(configured_path))
+    application.state.store = store
+    application.state.replication_manager = manager
 
     application.add_exception_handler(KeyNotFoundError, handle_missing_key)
     application.add_exception_handler(ValueError, handle_invalid_value)
@@ -180,6 +361,10 @@ def create_app(data_file: str | Path | None = None) -> FastAPI:
     application.add_exception_handler(
         NodeUnavailableError,
         handle_unavailable_node,
+    )
+    application.add_exception_handler(
+        ReplicationError,
+        handle_replication_error,
     )
     application.add_exception_handler(Exception, handle_unexpected_error)
 
@@ -191,24 +376,28 @@ def create_app(data_file: str | Path | None = None) -> FastAPI:
     def put_value(
         key: str,
         payload: PutRequest,
-        store: IKeyValueStore = Depends(get_store),
+        replication: ReplicationManager = Depends(get_replication_manager),
     ) -> Response:
         """
-        Создаёт значение по ключу или заменяет существующее.
+        Создаёт значение на основном узле или отклоняет запись на реплике.
 
         Parameters:
             key (str): Ключ MiniKV из пути запроса.
             payload (PutRequest): Тело с JSON-совместимым значением.
-            store (IKeyValueStore): Хранилище приложения.
+            replication (ReplicationManager): Менеджер текущего узла.
 
         Returns:
             Response: Пустой ответ с кодом HTTP 204.
 
         Fallbacks:
-            Некорректные данные преобразуются в HTTP 422, сбой сохранения —
-            в HTTP 500.
+            Реплика возвращает HTTP 403 без изменения состояния.
         """
-        store.put(key, payload.value)
+        if replication.role is NodeRole.REPLICA:
+            raise HTTPException(
+                status_code=403,
+                detail="Реплика доступна только для чтения",
+            )
+        replication.put(key, payload.value)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @application.get("/kv/{key}", response_model=ValueResponse)
@@ -238,23 +427,27 @@ def create_app(data_file: str | Path | None = None) -> FastAPI:
     )
     def delete_value(
         key: str,
-        store: IKeyValueStore = Depends(get_store),
+        replication: ReplicationManager = Depends(get_replication_manager),
     ) -> Response:
         """
-        Удаляет значение указанного ключа.
+        Удаляет значение на основном узле или отклоняет запрос реплики.
 
         Parameters:
             key (str): Ключ MiniKV из пути запроса.
-            store (IKeyValueStore): Хранилище приложения.
+            replication (ReplicationManager): Менеджер текущего узла.
 
         Returns:
             Response: Пустой ответ с кодом HTTP 204.
 
         Fallbacks:
-            Отсутствующий ключ преобразуется в HTTP 404, сбой сохранения —
-            в HTTP 500.
+            Реплика возвращает HTTP 403 без изменения состояния.
         """
-        store.delete(key)
+        if replication.role is NodeRole.REPLICA:
+            raise HTTPException(
+                status_code=403,
+                detail="Реплика доступна только для чтения",
+            )
+        replication.delete(key)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @application.get("/kv", response_model=KeysResponse)
@@ -280,7 +473,7 @@ def create_app(data_file: str | Path | None = None) -> FastAPI:
         store: IKeyValueStore = Depends(get_store),
     ) -> HealthResponse:
         """
-        Проверяет доступность экземпляра хранилища.
+        Проверяет доступность локального хранилища.
 
         Parameters:
             store (IKeyValueStore): Хранилище приложения.
@@ -296,6 +489,72 @@ def create_app(data_file: str | Path | None = None) -> FastAPI:
         except PersistenceError as error:
             raise NodeUnavailableError("Хранилище недоступно") from error
         return HealthResponse(status="ok")
+
+    @application.get(
+        "/replication/operations",
+        response_model=OperationsResponse,
+        response_model_exclude_none=True,
+    )
+    def replication_operations(
+        after: int = Query(ge=0),
+        replication: ReplicationManager = Depends(get_replication_manager),
+    ) -> OperationsResponse:
+        """
+        Возвращает следующую пачку упорядоченных операций primary.
+
+        Parameters:
+            after (int): Последний известный номер операции.
+            replication (ReplicationManager): Менеджер текущего узла.
+
+        Returns:
+            OperationsResponse: Номер primary и следующая пачка.
+
+        Fallbacks:
+            Реплика возвращает HTTP 403, неверный курсор — HTTP 422.
+        """
+        if replication.role is NodeRole.REPLICA:
+            raise HTTPException(
+                status_code=403,
+                detail="Лента операций доступна только на primary",
+            )
+        operations = [
+            MutationResponse(**replication.record(mutation))
+            for mutation in replication.operations_after(after)
+        ]
+        return OperationsResponse(
+            primary_sequence=replication.current_sequence,
+            operations=operations,
+        )
+
+    @application.get(
+        "/replication/status",
+        response_model=ReplicationStatusResponse,
+    )
+    def replication_status(
+        replication: ReplicationManager = Depends(get_replication_manager),
+    ) -> ReplicationStatusResponse:
+        """
+        Возвращает роль, номера и безопасное состояние синхронизации.
+
+        Parameters:
+            replication (ReplicationManager): Менеджер текущего узла.
+
+        Returns:
+            ReplicationStatusResponse: Диагностический статус репликации.
+
+        Fallbacks:
+            Неизвестные номера и время представлены как null.
+        """
+        current_status = replication.status()
+        return ReplicationStatusResponse(
+            role=current_status.role,
+            current_sequence=current_status.current_sequence,
+            primary_sequence=current_status.primary_sequence,
+            lag=current_status.lag,
+            healthy=current_status.healthy,
+            last_successful_sync=current_status.last_successful_sync,
+            last_error=current_status.last_error,
+        )
 
     return application
 
@@ -325,4 +584,3 @@ def main() -> None:
         raise ValueError("MINIKV_PORT должен быть в диапазоне от 1 до 65535")
 
     uvicorn.run(app, host="0.0.0.0", port=port)
-

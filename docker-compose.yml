@@ -1,29 +1,68 @@
+x-healthcheck: &healthcheck
+  test:
+    - CMD
+    - uv
+    - run
+    - --no-sync
+    - python
+    - -c
+    - >-
+      import urllib.request;
+      urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)
+  interval: 5s
+  timeout: 3s
+  retries: 5
+  start_period: 5s
+
+x-minikv: &minikv
+  build:
+    context: .
+  healthcheck: *healthcheck
+  restart: unless-stopped
+
 services:
-  minikv:
-    build:
-      context: .
+  primary:
+    <<: *minikv
     environment:
       MINIKV_DATA_FILE: /data/data.json
+      MINIKV_NODE_ROLE: primary
+      MINIKV_REPLICATION_LOG: /data/operations.jsonl
     ports:
       - "${MINIKV_PORT:-8000}:8000"
     volumes:
       - minikv-data:/data
-    healthcheck:
-      test:
-        - CMD
-        - uv
-        - run
-        - --no-sync
-        - python
-        - -c
-        - >-
-          import urllib.request;
-          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
-    restart: unless-stopped
+
+  replica-1:
+    <<: *minikv
+    depends_on:
+      primary:
+        condition: service_healthy
+    environment:
+      MINIKV_DATA_FILE: /data/data.json
+      MINIKV_NODE_ROLE: replica
+      MINIKV_PRIMARY_URL: http://primary:8000
+      MINIKV_REPLICATION_LOG: /data/operations.jsonl
+    ports:
+      - "${MINIKV_REPLICA_1_PORT:-8001}:8000"
+    volumes:
+      - minikv-replica-1-data:/data
+
+  replica-2:
+    <<: *minikv
+    depends_on:
+      primary:
+        condition: service_healthy
+    environment:
+      MINIKV_DATA_FILE: /data/data.json
+      MINIKV_NODE_ROLE: replica
+      MINIKV_PRIMARY_URL: http://primary:8000
+      MINIKV_REPLICATION_LOG: /data/operations.jsonl
+    ports:
+      - "${MINIKV_REPLICA_2_PORT:-8002}:8000"
+    volumes:
+      - minikv-replica-2-data:/data
 
 volumes:
   minikv-data:
+  minikv-replica-1-data:
+  minikv-replica-2-data:

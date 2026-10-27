@@ -225,3 +225,4 @@ tmp/
 /data/data.json
 /data/*.tmp
 /data/.*.tmp
+/data/*.jsonl

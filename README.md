@@ -20,7 +20,7 @@ defense artifacts, and a completion gate.
 
 ## Implemented milestones
 
-### Lab 1 — architecture
+### Lab 1 - architecture
 
 The first milestone defines four implementation-independent contracts:
 
@@ -37,7 +37,7 @@ functionality.
 See [the Lab 1 report](docs/lab1.md) and
 [the component diagram](docs/diagrams/lab1_components.md) for details.
 
-### Lab 2 — local persistence
+### Lab 2 - local persistence
 
 The second milestone provides a working `KeyValueStore`, an atomic JSON storage
 engine, and a CLI. For example:
@@ -54,13 +54,13 @@ at [data/data.example.json](data/data.example.json). See
 [the Lab 2 report](docs/lab2.md) for the architecture, demonstration, and
 verification commands.
 
-### Lab 3 — REST API and containers
+### Lab 3 - REST API and containers
 
 The third milestone exposes the persistent store through FastAPI and packages
 it as a non-root Docker Compose service with a named data volume:
 
 ```bash
-docker compose up --build -d
+docker compose up --build -d primary
 sh scripts/demo_api.sh
 ```
 
@@ -68,7 +68,7 @@ In PowerShell, use its built-in HTTP client and the PowerShell demo script
 instead of the Unix-specific `curl` and `sh` commands:
 
 ```powershell
-docker compose up --build -d
+docker compose up --build -d primary
 .\scripts\demo_api.ps1
 ```
 
@@ -80,6 +80,32 @@ uv run --env-file .env minikv-api
 ```
 
 OpenAPI documentation is available at the configured port. Docker Compose also
-reads `.env` automatically and uses `MINIKV_PORT` as the published host port. See [the Lab 3 report](docs/lab3.md) and
+reads `.env` automatically and uses `MINIKV_PORT` as the published host port.
+Starting only `primary` preserves the single-node Lab 3 deployment; starting
+the whole Compose project enables the Lab 4 replicas. See [the Lab 3 report](docs/lab3.md) and
 [the deployment diagram](docs/diagrams/lab3_deployment.md) for the endpoint
 contract, remote-access example, and persistence verification procedure.
+
+### Lab 4 - primary-replica replication
+
+The fourth milestone runs one writable primary and two read-only replicas. The
+primary records ordered mutations in a durable JSON Lines log, while replicas
+poll bounded batches and persist their applied sequence in an equivalent local
+log.
+
+```bash
+docker compose up --build -d
+bash scripts/demo_replication.sh
+```
+
+PowerShell:
+
+```powershell
+docker compose up --build -d
+.\scripts\demo_replication.ps1
+```
+
+Replication diagnostics are available at `/replication/status`. See
+[the Lab 4 report](docs/lab4.md) and
+[the interaction diagram](docs/diagrams/lab4_replication.md) for configuration,
+consistency behavior, recovery flow, and documented limitations.
