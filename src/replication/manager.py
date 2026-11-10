@@ -6,6 +6,7 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
+from time import monotonic
 
 import httpx
 
@@ -26,12 +27,16 @@ class ReplicationManager(IReplicationManager):
 
     Attributes:
         store (IKeyValueStore): Локальное хранилище узла.
-        role (NodeRole): Роль узла в топологии.
+        role (NodeRole): Текущая динамическая роль узла.
+        configured_role (NodeRole): Исходная роль узла.
         log_path (Path): Путь к локальному журналу операций.
         primary_url (str | None): Адрес основного узла.
         polling_interval (float): Интервал опроса в секундах.
         batch_size (int): Максимальный размер возвращаемой пачки.
         request_timeout (float): Тайм-аут HTTP-запроса в секундах.
+        peer_url (str | None): Адрес второго узла пары.
+        automatic_failover (bool): Признак автоматического переключения.
+        failover_timeout (float): Время недоступности до повышения.
 
     Fallbacks:
         Ошибки журнала представляются как PersistenceError, нарушения порядка
@@ -49,6 +54,10 @@ class ReplicationManager(IReplicationManager):
         batch_size: int = 100,
         request_timeout: float = 5.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        *,
+        peer_url: str | None = None,
+        automatic_failover: bool = False,
+        failover_timeout: float = 5.0,
     ) -> None:
         """
         Загружает и проверяет локальный журнал репликации.
@@ -63,6 +72,11 @@ class ReplicationManager(IReplicationManager):
             request_timeout (float): Тайм-аут запроса. По умолчанию: 5.0.
             transport (httpx.AsyncBaseTransport | None): Транспорт HTTP для
                 проверок. По умолчанию: None.
+            peer_url (str | None): Адрес второго узла. По умолчанию: None.
+            automatic_failover (bool): Включение переключения. По
+                умолчанию: False.
+            failover_timeout (float): Тайм-аут повышения в секундах. По
+                умолчанию: 5.0.
 
         Returns:
             None: Метод не возвращает значение.
@@ -72,11 +86,20 @@ class ReplicationManager(IReplicationManager):
         """
         self.store = store
         self.role = role
+        self.configured_role = role
         self.log_path = Path(log_path)
         self.primary_url = primary_url.rstrip("/") if primary_url else None
+        configured_peer = peer_url or (
+            primary_url if role is NodeRole.REPLICA else None
+        )
+        self.peer_url = (
+            configured_peer.rstrip("/") if configured_peer else None
+        )
         self.polling_interval = polling_interval
         self.batch_size = batch_size
         self.request_timeout = request_timeout
+        self.automatic_failover = automatic_failover
+        self.failover_timeout = failover_timeout
         self._transport = transport
         self._lock = Lock()
         self._mutations = self._load_log()
@@ -85,6 +108,8 @@ class ReplicationManager(IReplicationManager):
         )
         self._last_successful_sync: datetime | None = None
         self._last_error: str | None = None
+        self._promoted = False
+        self._unavailable_since: float | None = None
         self._task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
 
@@ -103,6 +128,22 @@ class ReplicationManager(IReplicationManager):
             Для пустого журнала возвращается 0.
         """
         return len(self._mutations)
+
+    @property
+    def preferred_primary(self) -> bool:
+        """
+        Сообщает, является ли узел исходным primary.
+
+        Parameters:
+            Не предусмотрены.
+
+        Returns:
+            bool: True для предпочтительного основного узла.
+
+        Fallbacks:
+            Не предусмотрены.
+        """
+        return self.configured_role is NodeRole.PRIMARY
 
     def _load_log(self) -> list[Mutation]:
         """
@@ -366,6 +407,39 @@ class ReplicationManager(IReplicationManager):
                 self._mutations[sequence : sequence + self.batch_size]
             )
 
+    def prepare_failback(self, sequence: int) -> tuple[int, list[Mutation]]:
+        """
+        Замораживает временный primary и передаёт остаток журнала.
+
+        Parameters:
+            sequence (int): Последний номер предпочтительного primary.
+
+        Returns:
+            tuple[int, list[Mutation]]: Итоговый номер и недостающие операции.
+
+        Fallbacks:
+            Вызов допустим только для временно повышенной реплики.
+        """
+        with self._lock:
+            if (
+                self.configured_role is not NodeRole.REPLICA
+                or self.role is not NodeRole.PRIMARY
+                or not self._promoted
+            ):
+                raise ReplicationError(
+                    "Узел не является временным primary"
+                )
+            if sequence < 0 or sequence > self.current_sequence:
+                raise ReplicationError(
+                    "Журналы узлов нельзя автоматически согласовать"
+                )
+            operations = list(self._mutations[sequence:])
+            final_sequence = self.current_sequence
+            self.role = NodeRole.REPLICA
+            self._promoted = False
+            self._primary_sequence = final_sequence
+            return final_sequence, operations
+
     async def synchronize_once(self) -> None:
         """
         Выполняет один опрос основного узла и применяет полученную пачку.
@@ -421,9 +495,9 @@ class ReplicationManager(IReplicationManager):
             self._last_error = "Не удалось применить операции репликации"
             raise
 
-    async def start(self) -> None:
+    async def _activate_preferred(self) -> None:
         """
-        Запускает фоновый опрос для реплики.
+        Возвращает предпочтительному узлу роль primary после синхронизации.
 
         Parameters:
             Не предусмотрены.
@@ -432,10 +506,128 @@ class ReplicationManager(IReplicationManager):
             None: Метод не возвращает значение.
 
         Fallbacks:
-            На основном узле метод ничего не запускает.
+            Недоступный peer не блокирует запуск из-за отсутствия quorum;
+            обнаруженный временный primary требует успешного failback.
         """
-        if self.role is NodeRole.PRIMARY or self._task is not None:
+        self.role = NodeRole.REPLICA
+        if self.peer_url is None:
+            self.role = NodeRole.PRIMARY
+            self._primary_sequence = self.current_sequence
             return
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.request_timeout,
+                transport=self._transport,
+            ) as client:
+                status_response = await client.get(
+                    f"{self.peer_url}/replication/status"
+                )
+                status_response.raise_for_status()
+                peer_status = status_response.json()
+                if not isinstance(peer_status, dict):
+                    raise ReplicationError(
+                        "Peer вернул некорректный статус"
+                    )
+        except httpx.HTTPError:
+            # Без quorum предпочтительный узел запускается самостоятельно.
+            self.role = NodeRole.PRIMARY
+            self._primary_sequence = self.current_sequence
+            return
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ReplicationError(
+                "Peer вернул некорректный статус"
+            ) from error
+
+        if (
+            peer_status.get("role") == NodeRole.PRIMARY.value
+            and peer_status.get("promoted") is True
+        ):
+            try:
+                async with httpx.AsyncClient(
+                    timeout=self.request_timeout,
+                    transport=self._transport,
+                ) as client:
+                    response = await client.post(
+                        f"{self.peer_url}/replication/failback",
+                        params={"after": self.current_sequence},
+                    )
+                    response.raise_for_status()
+                payload = response.json()
+                records = payload["operations"]
+                if not isinstance(records, list):
+                    raise ReplicationError(
+                        "Временный primary вернул неверный журнал"
+                    )
+                self.apply([
+                    self._parse_record(record) for record in records
+                ])
+                if payload["primary_sequence"] != self.current_sequence:
+                    raise ReplicationError(
+                        "Не завершена синхронизация перед failback"
+                    )
+            except httpx.HTTPError as error:
+                raise ReplicationError(
+                    "Временный primary не подтвердил failback"
+                ) from error
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as error:
+                raise ReplicationError(
+                    "Не удалось согласовать журнал перед failback"
+                ) from error
+
+        self.role = NodeRole.PRIMARY
+        self._promoted = False
+        self._primary_sequence = self.current_sequence
+        self._last_error = None
+
+    def _promote(self) -> None:
+        """
+        Повышает резервный узел после устойчивой недоступности primary.
+
+        Parameters:
+            Не предусмотрены.
+
+        Returns:
+            None: Метод не возвращает значение.
+
+        Fallbacks:
+            Предпочтительный primary этим методом не повышается.
+        """
+        with self._lock:
+            if self.configured_role is not NodeRole.REPLICA:
+                return
+            self.role = NodeRole.PRIMARY
+            self._promoted = True
+            self._primary_sequence = self.current_sequence
+            self._last_error = None
+
+    async def start(self) -> None:
+        """
+        Запускает восстановление роли и фоновую координацию.
+
+        Parameters:
+            Не предусмотрены.
+
+        Returns:
+            None: Метод не возвращает значение.
+
+        Fallbacks:
+            При выключенном failover сохраняется прежнее поведение.
+        """
+        if self._task is not None:
+            return
+        if not self.automatic_failover:
+            if self.role is NodeRole.PRIMARY:
+                return
+        elif self.preferred_primary:
+            await self._activate_preferred()
+            return
+
         self._stop_event = asyncio.Event()
         self._task = asyncio.create_task(
             self._poll(),
@@ -444,7 +636,7 @@ class ReplicationManager(IReplicationManager):
 
     async def _poll(self) -> None:
         """
-        Повторяет синхронизацию до остановки приложения.
+        Синхронизирует replica и повышает её после failover timeout.
 
         Parameters:
             Не предусмотрены.
@@ -453,15 +645,25 @@ class ReplicationManager(IReplicationManager):
             None: Метод завершается после сигнала остановки.
 
         Fallbacks:
-            Ошибки отдельного опроса не останавливают будущие попытки.
+            Ошибка отдельной попытки не останавливает цикл.
         """
         if self._stop_event is None:
             return
         while not self._stop_event.is_set():
-            try:
-                await self.synchronize_once()
-            except (PersistenceError, ReplicationError):
-                pass
+            if self.role is NodeRole.REPLICA:
+                if self._unavailable_since is None:
+                    self._unavailable_since = monotonic()
+                try:
+                    await self.synchronize_once()
+                    self._unavailable_since = None
+                except (PersistenceError, ReplicationError):
+                    if (
+                        self.automatic_failover
+                        and monotonic() - self._unavailable_since
+                        >= self.failover_timeout
+                    ):
+                        self._promote()
+                        self._unavailable_since = None
             try:
                 await asyncio.wait_for(
                     self._stop_event.wait(),
@@ -517,4 +719,6 @@ class ReplicationManager(IReplicationManager):
             healthy=self._last_error is None,
             last_successful_sync=self._last_successful_sync,
             last_error=self._last_error,
+            preferred_primary=self.preferred_primary,
+            promoted=self._promoted,
         )

@@ -57,19 +57,18 @@ verification commands.
 ### Lab 3 - REST API and containers
 
 The third milestone exposes the persistent store through FastAPI and packages
-it as a non-root Docker Compose service with a named data volume:
+it as a non-root Docker Compose service with a named data volume. In the current
+topology, `shard-0-primary` can be started independently as the Lab 3 node:
 
 ```bash
-docker compose up --build -d primary
-sh scripts/demo_api.sh
+docker compose up --build -d shard-0-primary
 ```
 
-In PowerShell, use its built-in HTTP client and the PowerShell demo script
-instead of the Unix-specific `curl` and `sh` commands:
+PowerShell demonstration:
 
 ```powershell
-docker compose up --build -d primary
-.\scripts\demo_api.ps1
+docker compose up --build -d shard-0-primary
+.\scripts\demo_api.ps1 -BaseUrl http://localhost:8001
 ```
 
 For local startup, both `MINIKV_DATA_FILE` and `MINIKV_PORT` can be loaded
@@ -79,30 +78,32 @@ from the root `.env` file:
 uv run --env-file .env minikv-api
 ```
 
-OpenAPI documentation is available at the configured port. Docker Compose also
-reads `.env` automatically and uses `MINIKV_PORT` as the published host port.
-Starting only `primary` preserves the single-node Lab 3 deployment; starting
-the whole Compose project enables the Lab 4 replicas. See [the Lab 3 report](docs/lab3.md) and
+OpenAPI documentation is available at the configured port. Docker Compose
+publishes `shard-0-primary` through `MINIKV_SHARD_0_PRIMARY_PORT`, which is
+8001 by default. Starting only that service preserves the single-node Lab 3
+deployment; starting the whole Compose project enables the final sharded
+topology. See [the Lab 3 report](docs/lab3.md) and
 [the deployment diagram](docs/diagrams/lab3_deployment.md) for the endpoint
 contract, remote-access example, and persistence verification procedure.
 
 ### Lab 4 - primary-replica replication
 
-The fourth milestone runs one writable primary and two read-only replicas. The
-primary records ordered mutations in a durable JSON Lines log, while replicas
-poll bounded batches and persist their applied sequence in an equivalent local
-log.
+The fourth milestone uses a preferred primary and a replica that is normally
+read-only. After a configurable outage the replica is promoted, accepts writes,
+and serves its operation feed. When the preferred primary returns, it retrieves
+the failover operations before becoming writable again. The final topology
+applies the same mechanism independently to both shards.
 
 ```bash
-docker compose up --build -d
-bash scripts/demo_replication.sh
+docker compose up --build -d shard-0-primary shard-0-replica
 ```
 
 PowerShell:
 
 ```powershell
-docker compose up --build -d
+docker compose up --build -d shard-0-primary shard-0-replica
 .\scripts\demo_replication.ps1
+.\scripts\demo_failover.ps1
 ```
 
 Replication diagnostics are available at `/replication/status`. See

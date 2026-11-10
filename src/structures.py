@@ -75,6 +75,8 @@ class ReplicationStatus:
         last_successful_sync (datetime | None): Время последнего успешного
             опроса основного узла.
         last_error (str | None): Безопасное описание последней ошибки.
+        preferred_primary (bool): Признак исходного основного узла.
+        promoted (bool): Признак временного повышения реплики.
 
     Fallbacks:
         Для основного узла неизвестные поля синхронизации равны None.
@@ -87,6 +89,8 @@ class ReplicationStatus:
     healthy: bool
     last_successful_sync: datetime | None
     last_error: str | None
+    preferred_primary: bool = False
+    promoted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +100,9 @@ class Shard:
 
     Attributes:
         name (str): Уникальное имя сегмента.
-        endpoint (str): Адрес основного узла сегмента.
+        endpoint (str): Адрес предпочтительного основного узла сегмента.
+        replica_endpoint (str | None): Адрес резервного узла. По умолчанию:
+            None.
 
     Fallbacks:
         Не предусмотрены.
@@ -104,3 +110,4 @@ class Shard:
 
     name: str
     endpoint: str
+    replica_endpoint: str | None = None

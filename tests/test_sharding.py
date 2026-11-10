@@ -253,3 +253,56 @@ def test_diagnostic_endpoint_does_not_contact_nodes() -> None:
 
     assert client.get("/shards/alpha").json() == {"shard": "shard-0"}
     assert client.get("/shards/beta").json() == {"shard": "shard-1"}
+
+
+def test_router_uses_promoted_replica_as_active_primary() -> None:
+    """
+    Проверяет маршрутизацию запроса на временно повышенную реплику.
+
+    Parameters:
+        Не предусмотрены.
+
+    Returns:
+        None: Тест не возвращает значение.
+
+    Fallbacks:
+        Не предусмотрены.
+    """
+    shards = [
+        Shard("shard-0", "http://shard-0", "http://shard-0-replica"),
+        Shard("shard-1", "http://shard-1", "http://shard-1-replica"),
+    ]
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        """
+        Имитирует статус пары и значение на повышенной реплике.
+
+        Parameters:
+            request (httpx.Request): Запрос router.
+
+        Returns:
+            httpx.Response: Диагностический или публичный ответ узла.
+
+        Fallbacks:
+            Неожиданный запрос вызывает AssertionError.
+        """
+        if request.url.path == "/replication/status":
+            role = (
+                "primary"
+                if request.url.host == "shard-0-replica"
+                else "replica"
+            )
+            return httpx.Response(200, json={"role": role})
+        if (
+            request.url.host == "shard-0-replica"
+            and request.url.path == "/kv/alpha"
+        ):
+            return httpx.Response(200, json={"value": "failover"})
+        raise AssertionError(f"Неожиданный запрос: {request.url}")
+
+    client = TestClient(create_router_app(
+        shards,
+        transport=httpx.MockTransport(handle_request),
+    ))
+
+    assert client.get("/kv/alpha").json() == {"value": "failover"}

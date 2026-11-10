@@ -1,26 +1,31 @@
 # Взаимодействие узлов в лабораторной работе № 4
 
 ~~~mermaid
-flowchart LR
-    Client[Клиент] -->|PUT / DELETE| PrimaryAPI[Primary FastAPI]
-    Client -->|GET| PrimaryAPI
-    Client -->|GET| Replica1API[Replica 1 FastAPI]
-    Client -->|GET| Replica2API[Replica 2 FastAPI]
-
-    PrimaryAPI --> PrimaryStore[KeyValueStore]
-    PrimaryStore --> PrimaryData[(primary data.json)]
-    PrimaryAPI --> PrimaryLog[(primary operations.jsonl)]
-
-    Replica1API -->|GET operations after N| PrimaryAPI
-    Replica2API -->|GET operations after N| PrimaryAPI
-
-    Replica1API --> Replica1Store[KeyValueStore]
-    Replica1Store --> Replica1Data[(replica 1 data.json)]
-    Replica1API --> Replica1Log[(replica 1 progress log)]
-
-    Replica2API --> Replica2Store[KeyValueStore]
-    Replica2Store --> Replica2Data[(replica 2 data.json)]
-    Replica2API --> Replica2Log[(replica 2 progress log)]
+sequenceDiagram
+    participant C as Клиент
+    participant P as Предпочтительный primary
+    participant R as Replica
+    C->>P: PUT / DELETE
+    R->>P: GET operations after N
+    P-->>R: упорядоченная пачка
+    Note over P: остановка
+    R->>P: повторные проверки
+    Note over R: promotion после failover timeout
+    C->>R: PUT / GET / DELETE
+    Note over P: восстановление
+    P->>R: GET replication status
+    P->>R: POST replication/failback?after=N
+    Note over R: блокировка записей и demotion
+    R-->>P: операции периода failover
+    Note over P: применение журнала и возврат роли primary
+    R->>P: обычная pull-репликация
 ~~~
 
-Каждый контейнер использует независимый том. Реплики самостоятельно опрашивают primary, поэтому восстановление после остановки не требует отправки snapshot или ручного копирования файлов.
+Контейнеры используют независимые тома. Временный primary продолжает общий
+журнал только после последнего применённого номера. При восстановлении исходный
+primary сначала забирает недостающий хвост журнала, после чего принимает записи.
+Механизм независимо применяется к обеим парам шардов.
+
+Схема не использует quorum или внешний координатор. Поэтому она предназначена
+для демонстрации остановки процесса primary; сетевое разделение может привести
+к split-brain и явно остаётся ограничением учебной реализации.

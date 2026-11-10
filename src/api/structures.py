@@ -127,6 +127,8 @@ class ReplicationStatusResponse(BaseModel):
         healthy (bool): Признак отсутствия ошибки.
         last_successful_sync (datetime | None): Время успешной синхронизации.
         last_error (str | None): Безопасное описание последней ошибки.
+        preferred_primary (bool): Признак исходного основного узла.
+        promoted (bool): Признак временного повышения реплики.
 
     Fallbacks:
         Неизвестные значения представлены как None.
@@ -139,3 +141,5 @@ class ReplicationStatusResponse(BaseModel):
     healthy: bool
     last_successful_sync: datetime | None
     last_error: str | None
+    preferred_primary: bool
+    promoted: bool

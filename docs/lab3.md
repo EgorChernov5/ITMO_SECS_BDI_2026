@@ -13,9 +13,10 @@
 - ответы при внутренних ошибках не раскрывают пути, трассировки или секреты;
 - зависимость хранилища заменяется через механизм FastAPI dependency overrides;
 - добавлены интеграционные тесты без внешнего сервера;
-- Docker Compose публикует настраиваемый порт основного узла и подключает
-  постоянный том, совместимый с односервисным развёртыванием;
-- `scripts/demo_api.ps1` выполняет повторяемый сценарий с изолированным ключом в Bash и PowerShell соответственно.
+- Docker Compose позволяет запустить `shard-0-primary` как отдельный узел и
+  подключает к нему постоянный том;
+- `scripts/demo_api.ps1` выполняет повторяемый сценарий с изолированным ключом
+  в PowerShell.
 
 ## 3. Архитектура
 
@@ -51,26 +52,29 @@ uv run --env-file .env minikv-api
 
 `MINIKV_DATA_FILE` задаёт локальный JSON-файл, а `MINIKV_PORT` - порт локального HTTP-сервера. Значения по умолчанию остаются `data/data.json` и `8000`.
 
-Основной контейнер `primary` автоматически читает `MINIKV_PORT` из корневого
-файла `.env`. Внутри контейнера база всегда хранится в `/data/data.json`:
+В актуальной Compose-топологии роль отдельного узла Lab 3 выполняет
+`shard-0-primary`. Внутри контейнера база хранится в `/data/data.json`, а
+порт хоста задаётся через `MINIKV_SHARD_0_PRIMARY_PORT` и по умолчанию равен
+`8001`:
 
 ```bash
-docker compose up --build -d primary
-docker compose ps primary
+docker compose up --build -d shard-0-primary
+docker compose ps shard-0-primary
 ```
 
 Такой запуск сохраняет односервисную топологию третьей лабораторной работы и
-не требует свободных портов реплик. Запуск без имени сервиса поднимает также
-`replica-1` и `replica-2` для четвёртой лабораторной работы.
+не запускает router или реплики. Запуск без имени сервиса поднимает итоговую
+топологию Lab 5: router и две пары primary-replica.
 
-Для изменения опубликованного порта достаточно изменить `MINIKV_PORT` в `.env`
-и повторно выполнить `docker compose up -d primary`.
+Для изменения опубликованного порта достаточно задать
+`MINIKV_SHARD_0_PRIMARY_PORT` и повторно выполнить
+`docker compose up -d shard-0-primary`.
 
 ## 6. Примеры запросов
 
 ```powershell
-$port = uv run --env-file .env python -c `
-    "import os; print(os.getenv('MINIKV_PORT', '8000'))"
+$binding = docker compose port shard-0-primary 8000
+$port = ($binding.Trim() -split ":")[-1]
 $baseUrl = "http://localhost:$port"
 
 $json = @{
@@ -100,7 +104,7 @@ $response = Invoke-WebRequest -UseBasicParsing "$baseUrl/kv"
 Полный повторяемый сценарий:
 
 ```powershell
-.\scripts\demo_api.ps1
+.\scripts\demo_api.ps1 -BaseUrl http://localhost:8001
 ```
 
 ## 7. Проверка сохранности данных
@@ -120,7 +124,7 @@ Invoke-RestMethod `
     -ContentType "application/json; charset=utf-8" `
     -Body $body
 
-docker compose up --build -d --force-recreate primary
+docker compose up --build -d --force-recreate shard-0-primary
 
 $response = Invoke-WebRequest -UseBasicParsing `
     "$baseUrl/kv/persistence-check"

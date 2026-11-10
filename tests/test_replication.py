@@ -288,3 +288,101 @@ def test_replica_recovers_after_temporary_primary_outage(
     assert replica.status().healthy is True
     assert replica.status().lag == 0
     assert replica_store.get("recovered") is True
+
+
+def test_replica_is_promoted_after_failover_timeout(tmp_path: Path) -> None:
+    """
+    Проверяет автоматическое повышение после устойчивой недоступности primary.
+
+    Parameters:
+        tmp_path (Path): Временный каталог pytest.
+
+    Returns:
+        None: Тест не возвращает значение.
+
+    Fallbacks:
+        Не предусмотрены.
+    """
+    def reject_request(request: httpx.Request) -> httpx.Response:
+        """
+        Имитирует остановленный предпочтительный primary.
+
+        Parameters:
+            request (httpx.Request): Запрос резервного узла.
+
+        Returns:
+            httpx.Response: Функция не возвращает ответ.
+
+        Fallbacks:
+            Всегда вызывает ConnectError.
+        """
+        raise httpx.ConnectError("Primary остановлен", request=request)
+
+    manager = ReplicationManager(
+        KeyValueStore(JsonStorage(tmp_path / "replica.json")),
+        NodeRole.REPLICA,
+        tmp_path / "replica.jsonl",
+        "http://primary",
+        polling_interval=0.005,
+        transport=httpx.MockTransport(reject_request),
+        automatic_failover=True,
+        failover_timeout=0.01,
+    )
+
+    async def run_scenario() -> None:
+        """
+        Запускает фоновый цикл на время, достаточное для promotion.
+
+        Parameters:
+            Не предусмотрены.
+
+        Returns:
+            None: Метод не возвращает значение.
+
+        Fallbacks:
+            Не предусмотрены.
+        """
+        await manager.start()
+        await asyncio.sleep(0.03)
+        await manager.stop()
+
+    asyncio.run(run_scenario())
+    manager.put("available", True)
+
+    assert manager.status().role is NodeRole.PRIMARY
+    assert manager.status().promoted is True
+
+
+def test_promoted_replica_freezes_and_returns_failover_log(
+    tmp_path: Path,
+) -> None:
+    """
+    Проверяет передачу операций временного primary перед failback.
+
+    Parameters:
+        tmp_path (Path): Временный каталог pytest.
+
+    Returns:
+        None: Тест не возвращает значение.
+
+    Fallbacks:
+        Не предусмотрены.
+    """
+    manager = ReplicationManager(
+        KeyValueStore(JsonStorage(tmp_path / "replica.json")),
+        NodeRole.REPLICA,
+        tmp_path / "replica.jsonl",
+        "http://primary",
+        automatic_failover=True,
+        failover_timeout=0.01,
+    )
+    manager.apply([Mutation(1, MutationType.PUT, "before", 1)])
+    manager._promote()
+    manager.put("during", 2)
+
+    sequence, operations = manager.prepare_failback(1)
+
+    assert sequence == 2
+    assert operations == [Mutation(2, MutationType.PUT, "during", 2)]
+    assert manager.status().role is NodeRole.REPLICA
+    assert manager.status().promoted is False

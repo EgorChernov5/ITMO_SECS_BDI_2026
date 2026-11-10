@@ -63,7 +63,24 @@ class ShardRouter(IShardRouter):
                 or not parsed_endpoint.netloc
             ):
                 raise ValueError("Адрес сегмента должен быть корректным HTTP URL")
-            normalized.append(Shard(shard.name, shard.endpoint.rstrip("/")))
+            replica_endpoint = None
+            if shard.replica_endpoint is not None:
+                parsed_replica = urlparse(shard.replica_endpoint)
+                if (
+                    parsed_replica.scheme not in {"http", "https"}
+                    or not parsed_replica.netloc
+                ):
+                    raise ValueError(
+                        "Адрес реплики должен быть корректным HTTP URL"
+                    )
+                replica_endpoint = shard.replica_endpoint.rstrip("/")
+                if replica_endpoint == shard.endpoint.rstrip("/"):
+                    raise ValueError("Узлы сегмента должны иметь разные адреса")
+            normalized.append(Shard(
+                shard.name,
+                shard.endpoint.rstrip("/"),
+                replica_endpoint,
+            ))
         if len({shard.endpoint for shard in normalized}) != 2:
             raise ValueError("Адреса сегментов должны быть уникальными")
         self.shards = (normalized[0], normalized[1])
@@ -130,6 +147,40 @@ class ShardedStore(IKeyValueStore):
         self.request_timeout = request_timeout
         self._transport = transport
 
+    def _active_endpoint(self, shard: Shard) -> str:
+        """
+        Определяет текущий primary сегмента по диагностическому статусу.
+
+        Parameters:
+            shard (Shard): Логический сегмент с парой узлов.
+
+        Returns:
+            str: Адрес активного primary.
+
+        Fallbacks:
+            Без резервного адреса возвращается прежний endpoint; если ни один
+            узел пары не объявлен primary, вызывается NodeUnavailableError.
+        """
+        if shard.replica_endpoint is None:
+            return shard.endpoint
+        for endpoint in (shard.endpoint, shard.replica_endpoint):
+            try:
+                with httpx.Client(
+                    timeout=self.request_timeout,
+                    transport=self._transport,
+                ) as client:
+                    response = client.get(
+                        f"{endpoint}/replication/status"
+                    )
+                if (
+                    response.status_code == status.HTTP_200_OK
+                    and response.json().get("role") == "primary"
+                ):
+                    return endpoint
+            except (AttributeError, httpx.RequestError, ValueError):
+                continue
+        raise NodeUnavailableError("Активный primary сегмента недоступен")
+
     def _request(
         self,
         method: str,
@@ -161,7 +212,7 @@ class ShardedStore(IKeyValueStore):
             ) as client:
                 return client.request(
                     method,
-                    f"{shard.endpoint}{path}",
+                    f"{self._active_endpoint(shard)}{path}",
                     json=payload,
                 )
         except httpx.RequestError as error:
@@ -363,10 +414,18 @@ def create_router_app(
         Shard(
             os.getenv("MINIKV_SHARD_0_ID", "shard-0"),
             os.getenv("MINIKV_SHARD_0_URL", "http://shard-0-primary:8000"),
+            os.getenv(
+                "MINIKV_SHARD_0_REPLICA_URL",
+                "http://shard-0-replica:8000",
+            ),
         ),
         Shard(
             os.getenv("MINIKV_SHARD_1_ID", "shard-1"),
             os.getenv("MINIKV_SHARD_1_URL", "http://shard-1-primary:8000"),
+            os.getenv(
+                "MINIKV_SHARD_1_REPLICA_URL",
+                "http://shard-1-replica:8000",
+            ),
         ),
     ]
     if request_timeout is None:

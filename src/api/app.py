@@ -29,6 +29,7 @@ from src.api.structures import (
 )
 from src.constants import (
     DEFAULT_DATA_FILE,
+    DEFAULT_FAILOVER_TIMEOUT,
     DEFAULT_REPLICATION_BATCH_SIZE,
     DEFAULT_REPLICATION_POLL_INTERVAL,
     DEFAULT_REPLICATION_REQUEST_TIMEOUT,
@@ -219,6 +220,9 @@ def create_app(
     polling_interval: float | None = None,
     batch_size: int | None = None,
     request_timeout: float | None = None,
+    peer_url: str | None = None,
+    automatic_failover: bool | None = None,
+    failover_timeout: float | None = None,
 ) -> FastAPI:
     """
     Создаёт REST-приложение с постоянным состоянием и репликацией.
@@ -234,6 +238,11 @@ def create_app(
         polling_interval (float | None): Интервал опроса. По умолчанию: None.
         batch_size (int | None): Максимальный размер пачки. По умолчанию: None.
         request_timeout (float | None): Тайм-аут запроса. По умолчанию: None.
+        peer_url (str | None): Адрес второго узла. По умолчанию: None.
+        automatic_failover (bool | None): Включение переключения. По
+            умолчанию: None.
+        failover_timeout (float | None): Тайм-аут повышения. По умолчанию:
+            None.
 
     Returns:
         FastAPI: Настроенное приложение REST API.
@@ -254,6 +263,16 @@ def create_app(
         ) from error
 
     configured_primary_url = primary_url or os.getenv("MINIKV_PRIMARY_URL")
+    configured_peer_url = peer_url or os.getenv("MINIKV_PEER_URL")
+    failover_value = os.getenv("MINIKV_AUTOMATIC_FAILOVER", "false")
+    if automatic_failover is None:
+        if failover_value.lower() not in {"true", "false"}:
+            raise ValueError(
+                "MINIKV_AUTOMATIC_FAILOVER должен быть true или false"
+            )
+        configured_automatic_failover = failover_value.lower() == "true"
+    else:
+        configured_automatic_failover = automatic_failover
     configured_log = Path(
         replication_log
         or os.getenv("MINIKV_REPLICATION_LOG")
@@ -280,6 +299,16 @@ def create_app(
                 )
             )
         )
+        configured_failover_timeout = (
+            failover_timeout
+            if failover_timeout is not None
+            else float(
+                os.getenv(
+                    "MINIKV_FAILOVER_TIMEOUT",
+                    str(DEFAULT_FAILOVER_TIMEOUT),
+                )
+            )
+        )
         configured_request_timeout = (
             request_timeout
             if request_timeout is not None
@@ -301,6 +330,8 @@ def create_app(
         raise ValueError("Размер пачки должен быть положительным")
     if configured_request_timeout <= 0:
         raise ValueError("Тайм-аут репликации должен быть больше нуля")
+    if configured_failover_timeout <= 0:
+        raise ValueError("Тайм-аут failover должен быть больше нуля")
     if configured_path.absolute() == configured_log.absolute():
         raise ValueError("Файл данных и журнал репликации должны различаться")
     if configured_role is NodeRole.REPLICA:
@@ -314,6 +345,17 @@ def create_app(
             )
     elif configured_primary_url is not None:
         raise ValueError("Primary не должен содержать MINIKV_PRIMARY_URL")
+    if configured_role is NodeRole.REPLICA and configured_peer_url is None:
+        configured_peer_url = configured_primary_url
+    if configured_automatic_failover:
+        parsed_peer_url = urlparse(configured_peer_url or "")
+        if (
+            parsed_peer_url.scheme not in {"http", "https"}
+            or not parsed_peer_url.netloc
+        ):
+            raise ValueError(
+                "Для automatic failover требуется MINIKV_PEER_URL"
+            )
 
     store = KeyValueStore(JsonStorage(configured_path))
     manager = ReplicationManager(
@@ -324,6 +366,9 @@ def create_app(
         polling_interval=configured_polling_interval,
         batch_size=configured_batch_size,
         request_timeout=configured_request_timeout,
+        peer_url=configured_peer_url,
+        automatic_failover=configured_automatic_failover,
+        failover_timeout=configured_failover_timeout,
     )
 
     @asynccontextmanager
@@ -526,6 +571,37 @@ def create_app(
             operations=operations,
         )
 
+    @application.post(
+        "/replication/failback",
+        response_model=OperationsResponse,
+        response_model_exclude_none=True,
+    )
+    def replication_failback(
+        after: int = Query(ge=0),
+        replication: ReplicationManager = Depends(get_replication_manager),
+    ) -> OperationsResponse:
+        """
+        Замораживает временный primary и передаёт журнал для failback.
+
+        Parameters:
+            after (int): Последний номер предпочтительного primary.
+            replication (ReplicationManager): Менеджер текущего узла.
+
+        Returns:
+            OperationsResponse: Итоговый номер и недостающие операции.
+
+        Fallbacks:
+            Обычный primary или replica возвращает HTTP 503.
+        """
+        primary_sequence, mutations = replication.prepare_failback(after)
+        return OperationsResponse(
+            primary_sequence=primary_sequence,
+            operations=[
+                MutationResponse(**replication.record(mutation))
+                for mutation in mutations
+            ],
+        )
+
     @application.get(
         "/replication/status",
         response_model=ReplicationStatusResponse,
@@ -554,6 +630,8 @@ def create_app(
             healthy=current_status.healthy,
             last_successful_sync=current_status.last_successful_sync,
             last_error=current_status.last_error,
+            preferred_primary=current_status.preferred_primary,
+            promoted=current_status.promoted,
         )
 
     return application
